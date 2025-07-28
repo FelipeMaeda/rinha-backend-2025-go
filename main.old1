@@ -1,0 +1,83 @@
+func handleSummary(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	f, err := os.Open(summaryFile)
+	if err != nil {
+		http.Error(w, "Erro ao abrir histórico", http.StatusInternalServerError)
+		log.Printf("[ERRO] Falha ao abrir o arquivo de resumo: %v", err)
+		return
+	}
+	defer f.Close()
+
+	w.Write([]byte("["))
+	first := true
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if !first {
+			w.Write([]byte(","))
+		}
+		first = false
+		w.Write(scanner.Bytes())
+
+		// Flush parcial se possível
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("[ERRO] Falha ao escanear o arquivo de resumo: %v", err)
+		http.Error(w, "Erro ao ler histórico", http.StatusInternalServerError)
+		return
+	}
+
+	w.Write([]byte("]"))
+	log.Printf("[INFO] Resumo de pagamentos retornado com sucesso")
+}
+
+func startWorkers(n int) {
+	for i := 0; i < n; i++ {
+		go func(id int) {
+			for {
+				files, err := os.ReadDir(queueDir)
+				if err != nil {
+					log.Printf("[Worker %d] Erro ao ler diretório da fila: %v", id, err)
+					continue
+				}
+
+				if len(files) == 0 {
+					runtime.Gosched() // cede CPU para outras goroutines
+					continue
+				}
+
+				for _, f := range files {
+					if f.IsDir() || filepath.Ext(f.Name()) != ".json" {
+						continue
+					}
+
+					path := filepath.Join(queueDir, f.Name())
+					data, err := os.ReadFile(path)
+					if err != nil {
+						log.Printf("[Worker %d] Falha ao ler arquivo: %v", id, err)
+						continue
+					}
+
+					var p Payment
+					if err := json.Unmarshal(data, &p); err != nil {
+						log.Printf("[Worker %d] Falha ao parsear JSON: %v", id, err)
+						continue
+					}
+
+					if sendToEndpoint(mainURL, p) || sendToEndpoint(fallbackURL, p) {
+						if err := os.Remove(path); err != nil {
+							log.Printf("[Worker %d] Erro ao remover arquivo: %v", id, err)
+						}
+						appendToSummary(p)
+						log.Printf("[Worker %d] Processado com sucesso: %s", id, p.ID)
+					} else {
+						log.Printf("[Worker %d] Nenhum endpoint respondeu para %s. Tentará de novo mais tarde.", id, p.ID)
+					}
+				}
+			}
+		}(i + 1)
+	}
+}
