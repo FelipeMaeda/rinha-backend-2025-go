@@ -31,7 +31,7 @@ services:
     volumes:
       - payments_data:/data
     tmpfs:
-     - /tmpfs
+     - /tmp
     environment:
       - WORKER_COUNT=14
     restart: unless-stopped
@@ -52,7 +52,7 @@ services:
     volumes:
       - payments_data:/data
     tmpfs:
-     - /tmpfs
+     - /tmp
     environment:
       - WORKER_COUNT=14
     restart: unless-stopped

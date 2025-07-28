@@ -20,11 +20,11 @@ type Payment struct {
 }
 
 const (
-	queueDir    = "/tmpfs/queue"
+	queueDir    = "/tmp"
 	summaryFile = "/data/summary.json"
 	mainURL     = "http://main-endpoint:8080/payments"
 	fallbackURL = "http://fallback-endpoint:8080/payments"
-	workerCount = 4
+	workerCount = 5
 )
 
 var mu sync.Mutex
