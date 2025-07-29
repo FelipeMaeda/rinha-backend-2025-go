@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"log"
@@ -11,7 +12,6 @@ import (
 	"runtime"
 	"sync"
 	"time"
-	"bytes"
 )
 
 type Payment struct {
@@ -20,14 +20,26 @@ type Payment struct {
 }
 
 const (
-	queueDir    = "/tmp"
-	summaryFile = "/data/summary.json"
-	mainURL     = "http://main-endpoint:8080/payments"
-	fallbackURL = "http://fallback-endpoint:8080/payments"
-	workerCount = 5
+	queueDir       = "/tmp"
+	priorityDir    = "/tmp/priority"
+	summaryFile    = "/data/summary.json"
+	logFilePath    = "/data/app.log"
+	mainURL        = "http://main-endpoint:8080/payments"
+	fallbackURL    = "http://fallback-endpoint:8080/payments"
+	workerCount    = 7
+	maxRetryDelay  = 10 * time.Second
 )
 
 var mu sync.Mutex
+
+func initLogger() {
+	f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("[FATAL] Falha ao abrir arquivo de log: %v", err)
+	}
+	log.SetOutput(io.MultiWriter(os.Stdout, f))
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+}
 
 func handleSummary(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -78,8 +90,8 @@ func handlePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filename := filepath.Join(queueDir, p.ID+".json")
-	if err := os.WriteFile(filename, body, 0644); err != nil {
+	dest := filepath.Join(queueDir, p.ID+".json")
+	if err := os.WriteFile(dest, body, 0644); err != nil {
 		http.Error(w, "Erro ao enfileirar pagamento", http.StatusInternalServerError)
 		log.Printf("[ERRO] Falha ao gravar arquivo: %v", err)
 		return
@@ -91,7 +103,7 @@ func handlePayment(w http.ResponseWriter, r *http.Request) {
 
 func sendToEndpoint(url string, p Payment) bool {
 	payload, _ := json.Marshal(p)
-	client := http.Client{Timeout: 5 * time.Millisecond}
+	client := http.Client{Timeout: 500 * time.Millisecond}
 	resp, err := client.Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		log.Printf("[WARN] Falha ao enviar para %s: %v", url, err)
@@ -124,78 +136,94 @@ func appendToSummary(p Payment) {
 	}
 }
 
-func startWorkers(n int) {
-	for i := 0; i < n; i++ {
-		go func(id int) {
-			for {
-				files, err := os.ReadDir(queueDir)
-				if err != nil {
-					log.Printf("[Worker %d] Erro ao ler diretório da fila: %v", id, err)
-					time.Sleep(100 * time.Millisecond)
-					continue
+func processQueue(id int, dir string) {
+	for {
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			log.Printf("[Worker %d] Erro ao ler diretório da fila: %v", id, err)
+			continue
+		}
+
+		for _, f := range files {
+			if f.IsDir() || filepath.Ext(f.Name()) != ".json" {
+				continue
+			}
+
+			path := filepath.Join(dir, f.Name())
+			lockPath := path + ".lock"
+			lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL, 0600)
+			if err != nil {
+				continue
+			}
+			lockFile.Close()
+
+			data, err := os.ReadFile(path)
+			if err != nil {
+				log.Printf("[Worker %d] Falha ao ler arquivo: %v", id, err)
+				os.Remove(lockPath)
+				continue
+			}
+
+			var p Payment
+			if err := json.Unmarshal(data, &p); err != nil {
+				log.Printf("[Worker %d] Falha ao parsear JSON: %v", id, err)
+				os.Remove(lockPath)
+				continue
+			}
+
+			success := false
+			delay := 100 * time.Millisecond
+			for attempt := 1; attempt <= 5; attempt++ {
+				if sendToEndpoint(mainURL, p) || sendToEndpoint(fallbackURL, p) {
+					success = true
+					break
 				}
-
-				if len(files) == 0 {
-					runtime.Gosched()
-					continue
-				}
-
-				for _, f := range files {
-					if f.IsDir() || filepath.Ext(f.Name()) != ".json" {
-						continue
-					}
-
-					path := filepath.Join(queueDir, f.Name())
-					lockPath := path + ".lock"
-
-					// Lock para evitar múltiplos workers no mesmo arquivo
-					lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL, 0600)
-					if err != nil {
-						continue
-					}
-					lockFile.Close()
-
-					data, err := os.ReadFile(path)
-					if err != nil {
-						log.Printf("[Worker %d] Falha ao ler arquivo: %v", id, err)
-						os.Remove(lockPath)
-						continue
-					}
-
-					var p Payment
-					if err := json.Unmarshal(data, &p); err != nil {
-						log.Printf("[Worker %d] Falha ao parsear JSON: %v", id, err)
-						os.Remove(lockPath)
-						continue
-					}
-
-					if sendToEndpoint(mainURL, p) || sendToEndpoint(fallbackURL, p) {
-						os.Remove(path)
-						appendToSummary(p)
-						log.Printf("[Worker %d] Processado com sucesso: %s", id, p.ID)
-					} else {
-						log.Printf("[Worker %d] Nenhum endpoint respondeu para %s", id, p.ID)
-					}
-
-					os.Remove(lockPath)
+				time.Sleep(delay)
+				delay *= 2
+				if delay > maxRetryDelay {
+					delay = maxRetryDelay
 				}
 			}
-		}(i + 1)
+
+			if success {
+				os.Remove(path)
+				appendToSummary(p)
+				log.Printf("[Worker %d] Processado com sucesso: %s", id, p.ID)
+			} else {
+				priorityPath := filepath.Join(priorityDir, filepath.Base(path))
+				os.Rename(path, priorityPath)
+				log.Printf("[Worker %d] Falha após tentativas. Movido para prioridade: %s", id, p.ID)
+			}
+
+			os.Remove(lockPath)
+		}
+		runtime.Gosched()
+	}
+}
+
+func startWorkers(n int) {
+	for i := 0; i < n; i++ {
+		id := i + 1
+		go processQueue(id, priorityDir)
+		go processQueue(id, queueDir)
 	}
 }
 
 func main() {
-	// Cria diretórios, se necessário
+	initLogger()
+
 	os.MkdirAll(queueDir, 0755)
+	os.MkdirAll(priorityDir, 0755)
 	os.MkdirAll(filepath.Dir(summaryFile), 0755)
+	os.MkdirAll(filepath.Dir(logFilePath), 0755)
 
 	http.HandleFunc("/payments", handlePayment)
 	http.HandleFunc("/payments-summary", handleSummary)
 
 	startWorkers(workerCount)
 
-	log.Println("[INFO] Servidor escutando em :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	log.Println("[INFO] Servidor escutando em :8081")
+	if err := http.ListenAndServe(":8081", nil); err != nil {
 		log.Fatalf("[FATAL] Falha ao iniciar servidor: %v", err)
 	}
 }
